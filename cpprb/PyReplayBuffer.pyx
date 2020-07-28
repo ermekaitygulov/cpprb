@@ -1238,6 +1238,83 @@ cdef class PrioritizedReplayBuffer(ReplayBuffer):
         if self.cache is not None:
             self.add_cache()
 
+
+@cython.embedsignature(True)
+cdef class DQfDBuffer(PrioritizedReplayBuffer):
+    cdef int demo_border
+    cdef float demo_eps_difference
+    def __cinit__(self, size, env_dict=None,*, eps=1e-4, demo_eps=1.,**kwrags):
+        self.demo_eps_difference = demo_eps - eps
+        self.demo_border = 0
+
+    def __init__(self,size, env_dict=None,*, demo_eps=1.,**kwrags):
+        pass
+
+    def add(self,*,priorities = None,**kwargs):
+        """Add environment(s) into replay buffer.
+
+        Multiple step environments can be added.
+
+        Parameters
+        ----------
+        priorities : array like or float or int
+            priorities of each environment
+        **kwargs : array like or float or int optional
+            environment(s) to be stored
+
+        Returns
+        -------
+        : int or None
+            the stored first index. If all values store into NstepBuffer and
+            no values store into main buffer, return None.
+        """
+        cdef size_t N = self.size_check.step_size(kwargs)
+        cdef size_t index = self.index
+        cdef size_t end = index + N
+
+        if end > self.buffer_size:
+            border = self.buffer_size - index
+            first = {key: value[:border] for key, value in kwargs.items()}
+            first_priorities = priorities if priorities is None else priorities[:border]
+            super().add(priorities=first_priorities, **first)
+            self.index = self.demo_border
+            second = {key: value[border:] for key, value in kwargs.items()}
+            second_priorities = priorities if priorities is None else priorities[border:]
+            index = super().add(priorities=second_priorities, **second)
+        else:
+            index = super().add(priorities=priorities, **kwargs)
+        self.index = max(self.index, self.demo_border)
+        return index
+
+    def add_demo(self, **kwargs):
+        cdef size_t index = self.index
+        if index > self.demo_border:
+            self.index = 0
+        index = super().add(**kwargs)
+        self.demo_border = self.index
+        return index
+
+    def update_priorities(self,indexes,priorities):
+        """Update priorities
+
+        Parameters
+        ----------
+        indexes : array_like
+            indexes to update priorities
+        priorities : array_like
+            priorities to update
+
+        Returns
+        -------
+        """
+        cdef int i
+        cdef int idx
+        for i, idx in enumerate(indexes):
+            if idx < self.demo_border:
+                priorities[i] += self.demo_eps_difference
+        super().update_priorities(indexes, priorities)
+
+
 def create_buffer(size,env_dict=None,*,prioritized = False,**kwargs):
     """Create specified version of replay buffer
 
