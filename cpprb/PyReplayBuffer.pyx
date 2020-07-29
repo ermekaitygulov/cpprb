@@ -894,7 +894,7 @@ cdef class ReplayBuffer:
 
         idx = np.array(idx,copy=False,ndmin=1)
         for name, b in self.buffer.items():
-            sample[name] = b[idx]
+            sample[name] = np.squeeze(b[idx])
 
         if self.has_next_of:
             next_idx = idx + 1
