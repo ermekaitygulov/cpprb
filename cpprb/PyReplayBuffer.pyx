@@ -1342,6 +1342,83 @@ cdef class PrioritizedReplayBuffer(ReplayBuffer):
 
         self.episode_len = 0
 
+
+@cython.embedsignature(True)
+cdef class DQfDBuffer(PrioritizedReplayBuffer):
+    cdef int demo_border
+    cdef float demo_eps_difference
+    def __cinit__(self, size, env_dict=None,*, eps=1e-4, demo_eps=1.,**kwrags):
+        self.demo_eps_difference = demo_eps - eps
+        self.demo_border = 0
+
+    def __init__(self,size, env_dict=None,*, demo_eps=1.,**kwrags):
+        pass
+
+    def add(self,*,priorities = None,**kwargs):
+        """Add environment(s) into replay buffer.
+
+        Multiple step environments can be added.
+
+        Parameters
+        ----------
+        priorities : array like or float or int
+            priorities of each environment
+        **kwargs : array like or float or int optional
+            environment(s) to be stored
+
+        Returns
+        -------
+        : int or None
+            the stored first index. If all values store into NstepBuffer and
+            no values store into main buffer, return None.
+        """
+        cdef size_t N = self.size_check.step_size(kwargs)
+        cdef size_t index = self.index
+        cdef size_t end = index + N
+
+        if end > self.buffer_size:
+            border = self.buffer_size - index
+            first = {key: value[:border] for key, value in kwargs.items()}
+            first_priorities = priorities if priorities is None else priorities[:border]
+            super().add(priorities=first_priorities, **first)
+            self.index = self.demo_border
+            second = {key: value[border:] for key, value in kwargs.items()}
+            second_priorities = priorities if priorities is None else priorities[border:]
+            index = super().add(priorities=second_priorities, **second)
+        else:
+            index = super().add(priorities=priorities, **kwargs)
+        self.index = max(self.index, self.demo_border)
+        return index
+
+    def add_demo(self, **kwargs):
+        cdef size_t index = self.index
+        if index > self.demo_border:
+            self.index = 0
+        index = super().add(**kwargs)
+        self.demo_border = self.index
+        return index
+
+    def update_priorities(self,indexes,priorities):
+        """Update priorities
+
+        Parameters
+        ----------
+        indexes : array_like
+            indexes to update priorities
+        priorities : array_like
+            priorities to update
+
+        Returns
+        -------
+        """
+        cdef int i
+        cdef int idx
+        for i, idx in enumerate(indexes):
+            if idx < self.demo_border:
+                priorities[i] += self.demo_eps_difference
+        super().update_priorities(indexes, priorities)
+
+
 def create_buffer(size,env_dict=None,*,prioritized = False,**kwargs):
     """Create specified version of replay buffer
 
@@ -1382,154 +1459,3 @@ def create_buffer(size,env_dict=None,*,prioritized = False,**kwargs):
         return buffer(size,env_dict,**kwargs)
 
     raise NotImplementedError(f"{buffer_name} is not Implemented")
-
-
-@cython.embedsignature(True)
-def train(buffer: ReplayBuffer,
-          env,
-          get_action: Callable,
-          update_policy: Callable,*,
-          max_steps: int=int(1e6),
-          max_episodes: Optional[int] = None,
-          batch_size: int = 64,
-          n_warmups: int = 0,
-          after_step: Optional[Callable] = None,
-          done_check: Optional[Callable] = None,
-          obs_update: Optional[Callable] = None,
-          rew_sum: Optional[Callable[[float, Any], float]] = None,
-          episode_callback: Optional[Callable[[int,int,float],Any]] = None,
-          logger = None):
-    """
-    Train RL policy (model)
-
-    Parameters
-    ----------
-    buffer: ReplayBuffer
-        Buffer to be used for training
-    env: gym.Enviroment compatible
-        Environment to learn
-    get_action: Callable
-        Callable taking `obs` and returning `action`
-    update_policy: Callable
-        Callable taking `sample`, `step`, and `episode`, updating policy,
-        and returning |TD|.
-    max_steps: int (optional)
-        Maximum steps to learn. The default value is `1000000`
-    max_episodes: int (optional)
-        Maximum episodes to learn. The defaul value is `None`
-    n_warmups: int (optional)
-        Warmup steps before sampling. The default value is `0` (No warmup)
-    after_step: Callable (optional)
-        Callable converting from `obs`, returns of `env.step(action)`,
-        `step`, and `episode` to `dict` of a transition for `ReplayBuffer.add`.
-        This function can also be used for step summary callback.
-    done_check: Callable (optional)
-        Callable checking done
-    obs_update: Callable (optional)
-        Callable updating obs
-    rew_sum: Callable[[float, Dict], float] (optional)
-        Callable summarizing episode reward
-    episode_callback: Callable[[int, int, float], Any] (optional)
-        Callable for episode summarization
-    logger: logging.Logger (optional)
-        Custom Logger
-
-    Raises
-    ------
-    ValueError:
-       When `max_step` is larger than `size_t` limit
-    """
-    warnings.warn("`cpprb.train` is still beta release. API can be changed.")
-
-    logger = logger or default_logger()
-
-    cdef size_t size_t_limit = -1
-    if max_steps >= int(size_t_limit):
-        raise ValueError(f"max_steps ({max_steps}) is too big. " +
-                         f"max_steps < {size_t_limit}")
-
-    cdef bool use_per = isinstance(buffer,PrioritizedReplayBuffer)
-    cdef bool has_after_step = after_step
-    cdef bool has_check = done_check
-    cdef bool has_obs_update = obs_update
-    cdef bool has_rew_sum = rew_sum
-    cdef bool has_episode_callback = episode_callback
-
-    cdef size_t _max_steps = max(max_steps,0)
-    cdef size_t _max_episodes = min(max(max_episodes or size_t_limit, 0),size_t_limit)
-    cdef size_t _n_warmup = min(max(0,n_warmups),size_t_limit)
-
-    cdef size_t step = 0
-    cdef size_t episode = 0
-    cdef size_t episode_step = 0
-    cdef float episode_reward = 0.0
-    cdef bool is_warmup = True
-
-    obs = env.reset()
-    cdef double episode_start_time = time.perf_counter()
-    cdef double episode_end_time = 0.0
-    for step in range(_max_steps):
-        is_warmup = (step < _n_warmup)
-
-        # Get action
-        action = get_action(obs,step,episode,is_warmup)
-
-        # Step environment
-        if has_after_step:
-            transition = after_step(obs,action,env.step(action),step,episode)
-        else:
-            next_obs, reward, done, _ = env.step(action)
-            transition = {"obs": obs,
-                          "act": action,
-                          "rew": reward,
-                          "next_obs": next_obs,
-                          "done": done}
-
-        # Add to buffer
-        buffer.add(**transition)
-
-        # For Nstep, ReplayBuffer can be empty after `add(**transition)` method
-        if (buffer.get_stored_size() > 0) and (not is_warmup):
-            # Sample
-            sample = buffer.sample(batch_size)
-            absTD = update_policy(sample,step,episode)
-
-            if use_per:
-                buffer.update_priorities(sample["indexes"],absTD)
-
-        # Summarize reward
-        episode_reward = (rew_sum(episode_reward,transition) if has_rew_sum
-                          else transition["rew"])
-
-        # Prepare the next step
-        if done_check(transition) if has_check else transition["done"]:
-            episode_end_time = time.perf_counter()
-
-            # step/episode_step are index.
-            # Total Steps/Episode Steps are counts.
-            SPS = (episode_step+1) / max(episode_end_time-episode_start_time,1e-9)
-            logger.info(f"Episode: {episode: 6} " +
-                        f"Total Steps: {step+1: 7} " +
-                        f"Episode Steps: {episode_step+1: 5} " +
-                        f"Reward: {episode_reward: =+7.2f} " +
-                        f"Steps/Sec: {SPS: =+5.2f}")
-
-            # Summary
-            if has_episode_callback:
-                episode_callback(episode,episode_step,episode_reward)
-
-            # Reset
-            obs = env.reset()
-            buffer.on_episode_end()
-            episode_reward = 0.0
-            episode_step = 0
-
-            # Update episode count
-            episode += 1
-            if episode >= _max_episodes:
-                break
-
-            episode_start_time = time.perf_counter()
-        else:
-            obs = obs_update(transition) if has_obs_update else transition["next_obs"]
-            episode_step += 1
