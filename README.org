@@ -175,8 +175,8 @@ CLOSED: [2020-01-17 Fri 23:09]
 :EXPORT_FILE_NAME: simple_usage
 :END:
 
-Here is a simple example for storing standard environment (aka. "obs",
-"act", "rew", "next_obs", and "done").
+Here is a simple example for storing standard environment (aka. ="obs"=,
+="act"=, ="rew"=, ="next_obs"=, and ="done"=).
 
 #+BEGIN_SRC python
 from cpprb import ReplayBuffer
@@ -200,6 +200,9 @@ done = 0
 for i in range(500):
     rb.add(obs=obs,act=act,rew=rew,next_obs=next_obs,done=done)
 
+    if done:
+        # Together with resetting environment, call ReplayBuffer.on_episode_end()
+        rb.on_episode_end()
 
 batch_size = 32
 sample = rb.sample(batch_size)
@@ -301,3 +304,5 @@ CLOSED: [2020-01-17 Fri 23:09]
 :EXPORT_FILE_NAME: lisence
 :END:
 cpprb is available under MIT lisence.
+
+#+INCLUDE: "./LICENSE" src

@@ -2,6 +2,11 @@
 # cython: linetrace=True
 
 import ctypes
+from logging import getLogger, StreamHandler, Formatter, INFO
+import time
+from typing import Any, Dict, Callable, Optional
+import warnings
+
 cimport numpy as np
 import numpy as np
 import cython
@@ -13,6 +18,26 @@ from .VectorWrapper cimport *
 from .VectorWrapper import (VectorWrapper,
                             VectorInt,VectorSize_t,
                             VectorDouble,PointerDouble,VectorFloat)
+
+def default_logger(level=INFO):
+    """
+    Create default logger for cpprb
+    """
+    logger = getLogger("cpprb")
+    logger.setLevel(level)
+
+    handler = StreamHandler()
+    handler.setLevel(level)
+
+    format = Formatter("%(asctime)s.%(msecs)03d [%(levelname)s] " +
+                       "(%(filename)s:%(lineno)s) %(message)s",
+                       "%Y%m%d-%H%M%S")
+    handler.setFormatter(format)
+
+    logger.addHandler(handler)
+    logger.propagate = False
+
+    return logger
 
 cdef double [::1] Cdouble(array):
     return np.ravel(np.array(array,copy=False,dtype=np.double,ndmin=1,order='C'))
@@ -422,7 +447,7 @@ def dict2buffer(buffer_size,env_dict,*,stack_compress = None,default_dtype = Non
                                                            shape=shape,
                                                            strides=strides)
         else:
-            buffer[name] = np.zeros(shape,dtype=defs.get("dtype",default_dtype))
+            buffer[name] = np.zeros(shape,dtype=defs.get("dtype",default_dtype)) + 1
 
         shape[0] = -1
         defs["add_shape"] = shape
@@ -743,6 +768,7 @@ cdef class ReplayBuffer:
     cdef env_dict
     cdef size_t index
     cdef size_t stored_size
+    cdef size_t episode_len
     cdef next_of
     cdef bool has_next_of
     cdef next_
@@ -753,6 +779,7 @@ cdef class ReplayBuffer:
     cdef StepChecker size_check
     cdef NstepBuffer nstep
     cdef bool use_nstep
+    cdef size_t cache_size
 
     def __cinit__(self,size,env_dict=None,*,
                   next_of=None,stack_compress=None,default_dtype=None,Nstep=None,
@@ -763,6 +790,7 @@ cdef class ReplayBuffer:
         self.buffer_size = size
         self.stored_size = 0
         self.index = 0
+        self.episode_len = 0
 
         self.compress_any = stack_compress
         self.stack_compress = np.array(stack_compress,ndmin=1,copy=False)
@@ -790,7 +818,19 @@ cdef class ReplayBuffer:
         self.next_ = {}
         self.cache = {} if (self.has_next_of or self.compress_any) else None
 
+        # Cache Size:
+        #     No "next_of" nor "stack_compress": -> 0
+        #     If "stack_compress": -> max of stack size -1
+        #     If "next_of": -> Increase by 1
+        self.cache_size = 1 if (self.cache is not None) else 0
+        if self.compress_any:
+            for name in self.stack_compress:
+                self.cache_size = max(self.cache_size,
+                                      np.array(self.env_dict[name]["shape"],
+                                               ndmin=1,copy=False)[-1] -1)
+
         if self.has_next_of:
+            self.cache_size += 1
             for name in self.next_of:
                 self.next_[name] = self.buffer[name][0].copy()
 
@@ -870,6 +910,7 @@ cdef class ReplayBuffer:
 
         self.stored_size = min(self.stored_size + N,self.buffer_size)
         self.index = end if end < self.buffer_size else remain
+        self.episode_len += N
         return index
 
     def get_all_transitions(self):
@@ -957,6 +998,9 @@ cdef class ReplayBuffer:
         """
         self.index = 0
         self.stored_size = 0
+        self.episode_len = 0
+
+        self.cache = {} if (self.has_next_of or self.compress_any) else None
 
         if self.use_nstep:
             self.nstep.clear()
@@ -993,19 +1037,51 @@ cdef class ReplayBuffer:
 
     cdef void add_cache(self):
         """Add last items into cache
+
+        The last items for "next_of" and "stack_compress" optimization
+        are moved to cache area.
+
+        If `self.cache is None`, do nothing.
+        If `self.stored_size == 0`, do nothing.
         """
-        cdef size_t key = (self.index or self.buffer_size) -1
-        self.cache[key] = {}
 
-        if self.has_next_of:
-            for name, value in self.next_.items():
-                self.cache[key][f"next_{name}"] = value
+        # If no cache configuration, do nothing
+        if self.cache is None:
+            return
 
-        if self.compress_any:
-            for name in self.stack_compress:
-                self.cache[key][name] = self.buffer[name][key].copy()
+        # If nothing are stored, do nothing
+        if self.stored_size == 0:
+            return
 
-    cpdef void on_episode_end(self):
+        cdef size_t key_end = (self.index or self.buffer_size)
+        # Next index (without wraparounding): key_end in [1,...,self.buffer_size]
+
+        cdef size_t key_min = 0
+        cdef size_t max_cache = min(self.cache_size,self.episode_len)
+        if key_end > max_cache:
+            key_min = key_end - max_cache
+
+        cdef size_t key = 0
+        cdef size_t next_key = 0
+        for key in range(key_min, key_end): # key_end is excluded
+            next_key = key + 1
+            cache_key = {}
+
+            if self.has_next_of:
+                if next_key == key_end:
+                    for name, value in self.next_.items():
+                        cache_key[f"next_{name}"] = value.copy()
+                else:
+                    for name in self.next_.keys():
+                        cache_key[f"next_{name}"] = self.buffer[name][next_key].copy()
+
+            if self.compress_any:
+                for name in self.stack_compress:
+                    cache_key[name] = self.buffer[name][key].copy()
+
+            self.cache[key] = cache_key
+
+    cpdef void on_episode_end(self) except *:
         """Call on episode end
 
         Notes
@@ -1018,8 +1094,27 @@ cdef class ReplayBuffer:
             self.add(**self.nstep.on_episode_end())
             self.use_nstep = True
 
-        if self.cache is not None:
-            self.add_cache()
+        self.add_cache()
+
+        self.episode_len = 0
+
+    cpdef size_t get_current_episode_len(self):
+        """Get current episode length
+
+        Returns
+        -------
+        episode_len : size_t
+        """
+        return self.episode_len
+
+    cpdef bool is_Nstep(self):
+        """Get whether use Nstep or not
+
+        Returns
+        -------
+        use_nstep : bool
+        """
+        return self.use_nstep
 
 @cython.embedsignature(True)
 cdef class PrioritizedReplayBuffer(ReplayBuffer):
@@ -1184,7 +1279,15 @@ cdef class PrioritizedReplayBuffer(ReplayBuffer):
 
         Returns
         -------
+
+        Raises
+        ------
+        TypeError: When `indexes` or `priorities` are `None`
         """
+
+        if priorities is None:
+            raise TypeError("`properties` must not be `None`")
+
         cdef size_t [:] idx = Csize(indexes)
         cdef float [:] ps = Cfloat(priorities)
 
@@ -1221,7 +1324,7 @@ cdef class PrioritizedReplayBuffer(ReplayBuffer):
         """
         return self.per.get_max_priority()
 
-    cpdef void on_episode_end(self):
+    cpdef void on_episode_end(self) except *:
         """Call on episode end
 
         Notes
@@ -1232,11 +1335,12 @@ cdef class PrioritizedReplayBuffer(ReplayBuffer):
         if self.use_nstep:
             self.use_nstep = False
             self.add(**self.nstep.on_episode_end(),
-                     **self.priorities_nstep.on_episode_end())
+                     priorities=self.priorities_nstep.on_episode_end()["priorities"])
             self.use_nstep = True
 
-        if self.cache is not None:
-            self.add_cache()
+        self.add_cache()
+
+        self.episode_len = 0
 
 
 @cython.embedsignature(True)

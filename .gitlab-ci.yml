@@ -4,15 +4,15 @@ variables: &global-variables
   COVERAGE_RCFILE: .coveragerc
   DOCKER_BUILDKIT: 1
   GIT_DEPTH: 10
+  PIP_CACHE_DIR: "$CI_PROJECT_DIR/.pip"
 
 stages:
   - build_image
   - build
   - test
-  - page_build
-  - test
   - test_coverage
   - bench_mark_test
+  - page_build
   - page_deploy
   - binary_build
   - upload
@@ -87,6 +87,29 @@ bench_mark_manual:
   except:
     - schedules
 
+.bench_mark_base2: &bench_mark2
+  image: docker:latest
+  stage: build_image
+  services:
+    - docker:dind
+  script:
+    - docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY
+    - docker pull $CI_REGISTRY_IMAGE/bench2:latest || true
+    - cd benchmark2
+    - docker build --pull=true --cache-from $CI_REGISTRY_IMAGE/bench2:latest -t $CI_REGISTRY_IMAGE/bench2:latest .
+    - docker push $CI_REGISTRY_IMAGE/bench2:latest
+
+bench_mark_schedule2:
+  <<: *bench_mark2
+  only:
+    - schedules
+
+bench_mark_manual2:
+  <<: *bench_mark2
+  when: manual
+  except:
+    - schedules
+
 cpprb_build:
   <<: *setup
   stage: build
@@ -129,11 +152,6 @@ multi_rew:
   script:
     - coverage run -m xmlrunner test/multi_rew.py
 
-gym:
-  <<: *py_setup
-  script:
-    - coverage run -m xmlrunner test/test_gym.py
-
 high_level_api:
   <<: *py_setup
   script:
@@ -154,16 +172,22 @@ util:
   script:
     - coverage run -m xmlrunner test/util.py
 
+train:
+  <<: *py_setup
+  script:
+    - coverage run -m xmlrunner test/train.py
+
 coverage:
   <<: *setup
   stage: test_coverage
   script:
+    - mkdir -p public/coverage
     - coverage combine
     - coverage report
     - coverage html -d public/coverage
   artifacts:
     paths:
-      - public
+      - public/coverage
   coverage: '/^TOTAL.*\s+(\d+\%)$/'
 
 emacs:
@@ -171,12 +195,22 @@ emacs:
   stage: build
   script:
     - emacs --batch README.org -l site/init.el --eval '(org-hugo-export-wim-to-md :all-subtrees nil t)'
-    - emacs --batch README.org --eval '(org-md-export-to-markdown)'
+    - emacs --batch CHANGELOG.org -l site/init.el --eval '(org-hugo-export-wim-to-md :all-subtrees nil t)'
     - cd site
     - emacs --batch site.org -l init.el --eval '(org-hugo-export-wim-to-md :all-subtrees nil t)'
   artifacts:
     paths:
       - site/content
+  except:
+    - schedules
+
+README_MD:
+  image: iquiw/alpine-emacs
+  stage: build
+  script:
+    - emacs --batch README.org --eval '(org-md-export-to-markdown)'
+  artifacts:
+    paths:
       - README.md
   except:
     - schedules
@@ -193,6 +227,27 @@ run_bench_mark:
       - "benchmark/*.png"
   except:
     - schedules
+  needs:
+    - job: coverage
+      artifacts: false
+    - job: cpprb_build
+
+run_bench_mark2:
+  image: $CI_REGISTRY_IMAGE/bench2:latest
+  stage: bench_mark_test
+  script:
+    - pip install $(echo dist/*.whl)
+    - cd benchmark2
+    - python benchmark.py
+  artifacts:
+    paths:
+      - "benchmark2/*.png"
+  except:
+    - schedules
+  needs:
+    - job: coverage
+      artifacts: false
+    - job: cpprb_build
 
 hugo:
   image: registry.gitlab.com/pages/hugo:latest
@@ -238,6 +293,7 @@ pages:
     - mv cpprb/*.html public/annotation/
     - mkdir -p public/benchmark
     - mv benchmark/*.png public/benchmark/
+    - mv benchmark2/*.png public/benchmark/
   artifacts:
     paths:
       - public
@@ -261,6 +317,9 @@ pypi:
   except:
     - branches
     - schedules
+  needs:
+    - manylinux
+    - README_MD
 
 repo:
   image: docker:latest
@@ -289,5 +348,12 @@ manylinux:
       - "wheelhouse-fix/cpprb-*.whl"
   except:
     - schedules
-  dependencies:
-    - coverage
+  needs:
+    - job: coverage
+      artifacts: false
+    - job: README_MD
+      artifacts: true
+  cache:
+    paths:
+      - "$CI_PROJECT_DIR/.pip"
+    key: "${CI_PROJECT_PATH}-BINARY-BUILD"
